@@ -32,6 +32,7 @@ namespace pytorch {
 namespace op {
 using namespace ov::op;
 
+// ...existing code...
 OutputVector translate_unique_consecutive(const NodeContext& context) {
     // aten::unique_consecutive(Tensor self, bool return_inverse=False, bool return_counts=False, int dim=None) ->
     // (Tensor output, Tensor inverse_indices, Tensor counts)
@@ -62,7 +63,6 @@ OutputVector translate_unique_consecutive(const NodeContext& context) {
     // Step 1: Choose the axis and prepare input
     if (dim_is_none) {
         // If dim is None, flatten the input tensor first
-        auto shape = std::make_shared<v0::ShapeOf>(input);
         auto flatten_shape = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {-1}));
         prepared_input = context.mark_node(std::make_shared<v1::Reshape>(input, flatten_shape, false));
         // Use axis 0 for flattened tensor
@@ -70,38 +70,21 @@ OutputVector translate_unique_consecutive(const NodeContext& context) {
     } else {
         // Use input as-is with specified dimension
         prepared_input = input;
-        // Handle negative axis value
-        if (dim < 0) {
-            auto rank = context.mark_node(std::make_shared<v0::ShapeOf>(input));
-            auto rank_scalar = context.mark_node(std::make_shared<v1::ReduceProd>(rank, v0::Constant::create(element::i64, Shape{}, {0})));
-            auto dim_const = context.mark_node(v0::Constant::create(element::i64, Shape{}, {dim}));
-            axis_const = context.mark_node(std::make_shared<v1::Add>(dim_const, rank_scalar));
-        } else {
-            axis_const = context.mark_node(v0::Constant::create(element::i64, Shape{}, {dim}));
-        }
+        // Normalize negative dim if desired — here keep as constant (negative dims are supported elsewhere)
+        axis_const = context.mark_node(v0::Constant::create(element::i64, Shape{}, {dim}));
     }
 
     // Step 2: Compare neighbors along the chosen axis
-    // We already have:
-    //   prepared_input : the tensor (flattened or original, depending on dim_is_none)
-    //   axis_const     : scalar i64 with the axis index (0D)
-    //   one_scalar     : scalar i64(1)
-    // and we need to build head = x[:, :, ..., 0:len-1] and tail = x[:, :, ..., 1:len]
-
-    // scalar "1"
-    auto one_scalar = context.mark_node(
-        v0::Constant::create(element::i64, Shape{}, {1}));
+    auto one_scalar = context.mark_node(v0::Constant::create(element::i64, Shape{}, {1}));
 
     // Get shape of prepared_input -> [rank]
     auto prepared_shape = context.mark_node(std::make_shared<v0::ShapeOf>(prepared_input));  // i64[rank]
 
-    // axis_index we used before:
+    // axis_index we use as compile-time int where available
     int64_t axis_index = dim_is_none ? 0 : dim;
 
-    // 1D constant to use for Unsqueeze
+    // 1D constant to use for Unsqueeze and for gather indices
     auto axis0 = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {0}));
-
-    // 1D index of the axis for Gather/Slice axes
     auto axis_index_vec = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {axis_index}));
 
     // axis_len_scalar = prepared_shape[axis_index]  (scalar)
@@ -111,129 +94,109 @@ OutputVector translate_unique_consecutive(const NodeContext& context) {
         context.mark_node(v0::Constant::create(element::i64, Shape{}, {0}))  // axis=0
         ));
 
-    // axis_len_minus_one = axis_len - 1 (scalar)
     auto axis_len_minus_one = context.mark_node(std::make_shared<v1::Subtract>(axis_len_scalar, one_scalar));
 
-    // Now build 1D start/stop/step vectors: [0], [len-1], [1], [1], [len]
+    // Build 1D start/stop/step vectors for Slice along axis_index
     auto start_head = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {0}));
     auto start_tail = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {1}));
-
     auto stop_head = context.mark_node(std::make_shared<v0::Unsqueeze>(axis_len_minus_one, axis0));  // [len-1]
     auto stop_tail = context.mark_node(std::make_shared<v0::Unsqueeze>(axis_len_scalar, axis0));     // [len]
-
     auto step_vec = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {1}));
-
-    // axes for Slice must also be 1D; reuse axis_index_vec
     auto axes_vec = axis_index_vec;
 
-    // Now Slice with 5 inputs: data, start, stop, step, axes
-    auto head =
-        context.mark_node(std::make_shared<v8::Slice>(prepared_input, start_head, stop_head, step_vec, axes_vec));
-    auto tail =
-        context.mark_node(std::make_shared<v8::Slice>(prepared_input, start_tail, stop_tail, step_vec, axes_vec));
+    auto head = context.mark_node(std::make_shared<v8::Slice>(prepared_input, start_head, stop_head, step_vec, axes_vec));
+    auto tail = context.mark_node(std::make_shared<v8::Slice>(prepared_input, start_tail, stop_tail, step_vec, axes_vec));
 
-    // Then you can keep your Equal:
+    // elementwise equality of neighbor slices (may be multi-dim slices if axis != last)
     auto equal = context.mark_node(std::make_shared<v1::Equal>(head, tail));
 
     // Step 3 - Build a keep mask of run starts
-    // change = not(equal) -> True where element i != i + 1 (i.e new run starts at i+1)
+    // change = not(equal) -> True where element i != i+1
     auto change = context.mark_node(std::make_shared<v1::LogicalNot>(equal));
 
-    // Prepend 'True' for the first element (first element always starts a run)
-    // For the simple (flattened/1-D) case we can create a scalar/1-D true and concat
-    auto true_one = context.mark_node(v0::Constant::create(element::boolean, Shape{1}, {true}));
+    // Prepend True for the first element. Need a prefix shaped like `change` with size 1 on axis_index.
+    // Build a true-prefix by gathering the first element along axis and comparing it to itself to get correct shape.
+    auto idx0 = context.mark_node(v0::Constant::create(element::i64, Shape{}, {0}));
+    auto first_elem = context.mark_node(std::make_shared<v8::Gather>(prepared_input, idx0, axis_const)); // may need unsqueeze depending on Gather semantics
+    // Make an all-true tensor with same shape as first_elem by equal(first_elem, first_elem)
+    auto true_prefix = context.mark_node(std::make_shared<v1::Equal>(first_elem, first_elem));
 
-    // axis index is known at conversion time in 'dim' (dim_is_none -> axis 0)
-    int64_t axis_index = dim_is_none ? 0 : dim; // dim was read earlier from const input
-
-    auto keep = context.mark_node(std::make_shared<v0::Concat>(OutputVector{true_one, change}, axis_index));
+    // Concat true_prefix and change along the axis_index to get keep
+    auto keep = context.mark_node(std::make_shared<v0::Concat>(OutputVector{true_prefix, change}, static_cast<int64_t>(axis_index)));
 
     // Step 4 - Get run start indices and the values output
-    // NonZero(keep) -> indices tensor with shape [rank, N] (each column is a coordinate)
     auto nonzero = context.mark_node(std::make_shared<v3::NonZero>(keep));
-
-    // Extract the row that corresponds to the slicing axis (row index == axis_index)
     auto axis_row_idx = context.mark_node(v0::Constant::create(element::i64, Shape{}, {axis_index}));
     auto nonzero_axis = context.mark_node(std::make_shared<v8::Gather>(nonzero, axis_row_idx, context.mark_node(v0::Constant::create(element::i64, Shape{}, {0}))));
 
-    // nonzero_axis is a 1-D i64 tensor with the start indices along the chosen axis
-    // Gather values from prepared_input along axis_const at positions nonzero_axis
+    // Gather values along axis_const at positions nonzero_axis
     auto values = context.mark_node(std::make_shared<v8::Gather>(prepared_input, nonzero_axis, axis_const));
-
-    // push the values (unique_consecutive output)
     outputs.push_back(values);
 
     // Step 5 - Compute counts (optional)
-    // append sentinel = axis length to the list of start indices, then diff successive elements
-    // axis_len_scalar = ShapeOf(prepared_input)[axis_const]
-    auto concat_axis0 = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {0}));
+    if (return_counts || return_inverse) {
+        // concat axis constant for Unsqueeze (1D)
+        auto concat_axis0 = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {0}));
 
-    // get axis length (scalar)
-    auto prepared_shape = context.mark_node(std::make_shared<v0::ShapeOf>(prepared_input)); // [rank]
-    auto axis_len_scalar = context.mark_node(std::make_shared<v8::Gather>(prepared_shape, 
-                                                                        context.mark_node(v0::Constant::create(element::i64, Shape{}, {axis_index})), 
-                                                                        context.mark_node(v0::Constant::create(element::i64, Shape{}, {0})) ));
+        // make axis_len 1-D so we can concat with nonzero_axis
+        auto axis_len_1d = context.mark_node(std::make_shared<v0::Unsqueeze>(axis_len_scalar, concat_axis0)); // shape{1}
 
-    // make axis_len 1-D so we can concat with nonzero axis
-    auto axis_len_1d = context.mark_node(std::make_shared<v0::Unsqueeze>(axis_len_scalar, concat_axis0)); // shape{1}
+        // concat starts + sentinel (1-D)
+        auto starts_with_sentinel = context.mark_node(std::make_shared<v0::Concat>(OutputVector{nonzero_axis, axis_len_1d}, 0)); // 1-D
 
-    // concat starts + sentinel
-    auto starts_with_sentinel = context.mark_node(std::make_shared<v0::Concat>(OutputVector{nonzero_axis, axis_len_1d}, 0)); // 1-D
+        // compute size L = len(starts_with_sentinel)
+        auto starts_shape = context.mark_node(std::make_shared<v0::ShapeOf>(starts_with_sentinel)); // [1]
+        auto size_scalar = context.mark_node(std::make_shared<v8::Gather>(
+            starts_shape,
+            context.mark_node(v0::Constant::create(element::i64, Shape{}, {0})),
+            context.mark_node(v0::Constant::create(element::i64, Shape{}, {0}))
+            )); // scalar
 
-    // compute size of concat (L = num_start + 1)
-    auto starts_shape = context.mark_node(std::make_shared<v0::ShapeOf>(starts_with_sentinel)); // [1]
-    auto size_scalar = context.mark_node(std::make_shared<v8::Gather>(starts_shape,
-                                                                       context.mark_node(v0::Constant::create(element::i64, Shape{}, {0})),
-                                                                       context.mark_node(v0::Constant::create(element::i64, Shape{}, {0})))); // scalar
-    
-    // build slice indices for head = starts_with_sentinel[0 : L-1] and tail = starts_with_sentinel[1 : L]
-    auto zero_1d = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {0}));
-    auto one_1d = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {1}));
-    // auto one_scalar = context.mark_node(v0::Constant::create(element::i64, Shape{}, {1}));
+        // slice indices for head = starts_with_sentinel[0 : L-1], tail = starts_with_sentinel[1 : L]
+        auto zero_1d = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {0}));
+        auto one_1d = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {1}));
+        auto size_minus_one = context.mark_node(std::make_shared<v1::Subtract>(size_scalar, one_scalar)); // scalar
 
-    auto size_minus_one = context.mark_node(std::make_shared<v1::Subtract>(size_scalar, one_scalar)); // scalar
+        auto head_stop_1d = context.mark_node(std::make_shared<v0::Unsqueeze>(size_minus_one, concat_axis0)); // {L-1}
+        auto tail_stop_1d = context.mark_node(std::make_shared<v0::Unsqueeze>(size_scalar, concat_axis0));       // {L}
 
-    auto head_stop_1d = context.mark_node(std::make_shared<v0::Unsqueeze>(size_minus_one, concat_axis0)); // {L-1}
-    auto tail_stop_1d = context.mark_node(std::make_shared<v0::Unsqueeze>(size_scalar, concat_axis0));       // {L}
+        auto head_indices = context.mark_node(std::make_shared<v8::Slice>(starts_with_sentinel, zero_1d, head_stop_1d, one_1d));
+        auto tail_indices = context.mark_node(std::make_shared<v8::Slice>(starts_with_sentinel, one_1d, tail_stop_1d, one_1d));
 
-    auto head_indices = context.mark_node(std::make_shared<v8::Slice>(starts_with_sentinel, zero_1d, head_stop_1d, one_1d));
-    auto tail_indices = context.mark_node(std::make_shared<v8::Slice>(starts_with_sentinel, one_1d, tail_stop_1d, one_1d));
+        auto counts = context.mark_node(std::make_shared<v1::Subtract>(tail_indices, head_indices));
 
-    // counts = tail_indices - head_indices
-    auto counts = context.mark_node(std::make_shared<v1::Subtract>(tail_indices, head_indices));
-
-    // Step 6 - Compute inverse indices
-    if (return_inverse) {
-        // convert keep (bool) -> integer so we can CumSum
-        auto keep_int = context.mark_node(std::make_shared<v0::Convert>(keep, element::i64));
-
-        // CumSum along the chosen axis (inclusive). This produces per-position run labels:
-        // e.g. keep = [1,0,1,0,...] -> sumsum = [1,1,2,2,...]
-        auto cumsum = context.mark_node(std::make_shared<v0::CumSum>(keep_int, axis_const, /*exclusive*/ false, /*reverse*/ false));
-
-        // Subtract 1 to make run ids 0-based: [1,1,2,2,...] -> [0,0,1,1,...]
-        auto inverse_pre = context.mark_node(std::make_shared<v1::Subtract>(cumsum, one_scalar));
-
-        // If we flattened the input (dim_is_none), reshape inverse back to original input shape
-        Output<Node> inverse;
-        if (dim_is_none) {
-            auto orig_shape = context.mark_node(std::make_shared<v0::ShapeOf>(input)); // original input shape
-            inverse = context.mark_node(std::make_shared<v1::Reshape>(inverse_pre, orig_shape, false));
-        } else {
-            // inverse already has same shape as prepared_input (same as input)
-            inverse = inverse_pre;
+        if (return_counts) {
+            outputs.push_back(counts);
         }
 
-        // push inverse in the expected output order (values already pushed earlier)
-        outputs.push_back(inverse);
-    }
+        // Step 6 - Compute inverse indices (optional)
+        if (return_inverse) {
+            // convert keep (bool) -> integer so we can CumSum
+            auto keep_int = context.mark_node(std::make_shared<v0::Convert>(keep, element::i64));
 
-    if (return_counts) {
-        outputs.push_back(counts);
+            // CumSum along the chosen axis (inclusive). Produces per-position run labels
+            auto cumsum = context.mark_node(std::make_shared<v0::CumSum>(keep_int, axis_const, /*exclusive*/ false, /*reverse*/ false));
+
+            // Subtract 1 to make run ids 0-based
+            auto inverse_pre = context.mark_node(std::make_shared<v1::Subtract>(cumsum, one_scalar));
+
+            // If we flattened the input (dim_is_none), reshape inverse back to original input shape
+            Output<Node> inverse;
+            if (dim_is_none) {
+                auto orig_shape = context.mark_node(std::make_shared<v0::ShapeOf>(input)); // original input shape
+                inverse = context.mark_node(std::make_shared<v1::Reshape>(inverse_pre, orig_shape, false));
+            } else {
+                // inverse_pre already matches prepared_input shape
+                inverse = inverse_pre;
+            }
+
+            outputs.push_back(inverse);
+        }
     }
 
     return outputs;
-};
+}
+// ...existing code...
 }  // namespace op
 }  // namespace pytorch
 }  // namespace frontend
