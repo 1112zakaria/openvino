@@ -81,29 +81,58 @@ OutputVector translate_unique_consecutive(const NodeContext& context) {
         }
     }
 
-    // Step 2: Compare the neighbors along axis a
-    // build per-axis start/stop/step vectors (same length as input rank)
-    auto shape = context.mark_node(std::make_shared<v0::ShapeOf>(prepared_input));
-    auto zero_scalar = context.mark_node(v0::Constant::create(element::i64, Shape{}, {0}));
-    auto one_scalar = context.mark_node(v0::Constant::create(element::i64, Shape{}, {1}));
+    // Step 2: Compare neighbors along the chosen axis
+    // We already have:
+    //   prepared_input : the tensor (flattened or original, depending on dim_is_none)
+    //   axis_const     : scalar i64 with the axis index (0D)
+    //   one_scalar     : scalar i64(1)
+    // and we need to build head = x[:, :, ..., 0:len-1] and tail = x[:, :, ..., 1:len]
 
-    // broadcast scalars to shape-of-input to produce length-rank vectors
-    auto zeros = context.mark_node(std::make_shared<v3::Broadcast>(zero_scalar, shape));
-    auto ones = context.mark_node(std::make_shared<v3::Broadcast>(one_scalar, shape));
-    
-    // head: start = [0, ...], stop = shape - 1 (exclusive)
-    auto head_start = zeros;
-    auto head_stop = context.mark_node(std::make_shared<v1::Subtract>(shape, ones));
-    auto step = ones;
+    // scalar "1"
+    auto one_scalar = context.mark_node(
+        v0::Constant::create(element::i64, Shape{}, {1}));
 
-    // tail: start = [1, ...], stop = shape (exclusive -> equals shape)
-    auto tail_start = ones;
-    auto tail_stop = shape;
+    // Get shape of prepared_input -> [rank]
+    auto prepared_shape = context.mark_node(std::make_shared<v0::ShapeOf>(prepared_input));  // i64[rank]
 
-    // slice along all axes; only the axis of interest changes values in the vectors above
-    auto head = context.mark_node(std::make_shared<v8::Slice>(prepared_input, head_start, head_stop, step));
-    auto tail = context.mark_node(std::make_shared<v8::Slice>(prepared_input, tail_start, tail_stop, step));
+    // axis_index we used before:
+    int64_t axis_index = dim_is_none ? 0 : dim;
 
+    // 1D constant to use for Unsqueeze
+    auto axis0 = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {0}));
+
+    // 1D index of the axis for Gather/Slice axes
+    auto axis_index_vec = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {axis_index}));
+
+    // axis_len_scalar = prepared_shape[axis_index]  (scalar)
+    auto axis_len_scalar = context.mark_node(std::make_shared<v8::Gather>(
+        prepared_shape,
+        axis_index_vec,                                                      // indices
+        context.mark_node(v0::Constant::create(element::i64, Shape{}, {0}))  // axis=0
+        ));
+
+    // axis_len_minus_one = axis_len - 1 (scalar)
+    auto axis_len_minus_one = context.mark_node(std::make_shared<v1::Subtract>(axis_len_scalar, one_scalar));
+
+    // Now build 1D start/stop/step vectors: [0], [len-1], [1], [1], [len]
+    auto start_head = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {0}));
+    auto start_tail = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {1}));
+
+    auto stop_head = context.mark_node(std::make_shared<v0::Unsqueeze>(axis_len_minus_one, axis0));  // [len-1]
+    auto stop_tail = context.mark_node(std::make_shared<v0::Unsqueeze>(axis_len_scalar, axis0));     // [len]
+
+    auto step_vec = context.mark_node(v0::Constant::create(element::i64, Shape{1}, {1}));
+
+    // axes for Slice must also be 1D; reuse axis_index_vec
+    auto axes_vec = axis_index_vec;
+
+    // Now Slice with 5 inputs: data, start, stop, step, axes
+    auto head =
+        context.mark_node(std::make_shared<v8::Slice>(prepared_input, start_head, stop_head, step_vec, axes_vec));
+    auto tail =
+        context.mark_node(std::make_shared<v8::Slice>(prepared_input, start_tail, stop_tail, step_vec, axes_vec));
+
+    // Then you can keep your Equal:
     auto equal = context.mark_node(std::make_shared<v1::Equal>(head, tail));
 
     // Step 3 - Build a keep mask of run starts
