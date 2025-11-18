@@ -38,6 +38,7 @@ def build_unique_consecutive_model(
 
     # Tensor axis (for ops that expect tensor scalars)
     axis_const = opset8.constant(np.int64(axis_index))
+    print("axis_const", axis_const.outputs())
 
     # ---- Shapes / small constants ----
     prep_shape   = opset8.shape_of(prepared)                     # i64[rank]
@@ -46,18 +47,18 @@ def build_unique_consecutive_model(
     one_1d       = opset8.constant(np.array([1], np.int64))
     zero_s       = opset8.constant(np.int64(0))
     one_s        = opset8.constant(np.int64(1))
-    print(one_s)
+    print("one_s", one_s)
 
     # ---- Axis length (scalar) and 1D forms for Slice ----
-    axis_len     = opset8.gather(prep_shape, axis_idx_vec, 0)    # scalar
-    print(axis_len.get_output_shape(0))
+    axis_len     = opset8.gather(prep_shape, axis_const, 0)    # scalar
+    print("axis_len", axis_len.get_output_shape(0), axis_len.outputs())
     axis_len_m1  = opset8.subtract(axis_len, one_s)              # scalar
-    print(axis_len_m1.get_output_shape(0))
+    print("axis_len_m1", axis_len_m1.get_output_shape(0))
     axis_len_1d  = opset8.unsqueeze(axis_len,     opset8.constant(0))  # {len}
     axis_m1_1d   = opset8.unsqueeze(axis_len_m1,  opset8.constant(0))  # {len-1}
 
-    print(axis_len_1d.get_output_shape(0))
-    print(axis_m1_1d.get_output_shape(0))
+    print("axis_len_1d", axis_len_1d.get_output_shape(0))
+    print("axis_m1_1d", axis_m1_1d.get_output_shape(0))
 
     # ---- Neighbor slices along axis: head = [0:len-1], tail = [1:len] ----
     head = opset8.slice(prepared, zero_1d, axis_m1_1d, one_1d, axis_idx_vec)
@@ -129,7 +130,9 @@ if __name__ == "__main__":
     outs = exec1([x1])
     print("\n[1-D, dim=None]")
     for i, o in enumerate(outs):
-        print(f"out[{i}] -> shape={o.shape}, dtype={o.dtype}, data={o}")
+        # print(f"out[{i}] -> shape={o.shape}, dtype={o.dtype}, data={o}")
+        pass
+    print("outs1", outs)
 
     # 2-D example: along axis=1 (dim=1)
     m2 = build_unique_consecutive_model(shape=[-1, -1], dim=1, return_inverse=True, return_counts=True)
@@ -139,4 +142,6 @@ if __name__ == "__main__":
     outs2 = exec2([x2])
     print("\n[2-D, dim=1]")
     for i, o in enumerate(outs2):
-        print(f"out[{i}] -> shape={o.shape}, dtype={o.dtype}, data={o}")
+        # print(f"out[{i}] -> shape={o.shape}, dtype={o.dtype}, data={o}")
+        pass
+    print("outs2", outs2)
